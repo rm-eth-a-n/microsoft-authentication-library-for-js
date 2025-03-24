@@ -17,12 +17,17 @@ import {
     PopTokenGenerator,
     ProtocolMode,
     RequestParameterBuilder,
+    OAuthResponseType,
     Constants,
 } from "@azure/msal-common/browser";
 import { BrowserConfiguration } from "../config/Configuration.js";
 import { BrowserConstants } from "../utils/BrowserConstants.js";
 import { version } from "../packageMetadata.js";
 import { CryptoOps } from "../crypto/CryptoOps.js";
+import {
+    BrowserAuthErrorCodes,
+    createBrowserAuthError,
+} from "../error/BrowserAuthError.js";
 
 /**
  * Returns map of parameters that are applicable to all calls to /authorize whether using PKCE or EAR
@@ -124,7 +129,7 @@ export async function getAuthCodeRequestUrl(
         performanceClient,
         request.correlationId
     )(config, authority, request, logger, performanceClient);
-    RequestParameterBuilder.addResponseTypeCode(parameters);
+    RequestParameterBuilder.addResponseType(parameters, OAuthResponseType.CODE);
 
     RequestParameterBuilder.addCodeChallengeParams(
         parameters,
@@ -133,4 +138,65 @@ export async function getAuthCodeRequestUrl(
     );
 
     return AuthorizeProtocol.getAuthorizeUrl(authority, parameters);
+}
+
+/**
+ * Gets the form that will be posted to /authorize with request parameters when using EAR
+ */
+export async function getEARForm(
+    frame: Document,
+    config: BrowserConfiguration,
+    authority: Authority,
+    request: CommonAuthorizationUrlRequest,
+    logger: Logger,
+    performanceClient: IPerformanceClient
+): Promise<HTMLFormElement> {
+    if (!request.earJwk) {
+        throw createBrowserAuthError(BrowserAuthErrorCodes.earJwkEmpty);
+    }
+
+    const parameters = await getStandardParameters(
+        config,
+        authority,
+        request,
+        logger,
+        performanceClient
+    );
+
+    RequestParameterBuilder.addResponseType(
+        parameters,
+        OAuthResponseType.IDTOKEN_TOKEN_REFRESHTOKEN
+    );
+    RequestParameterBuilder.addEARParameters(parameters, request.earJwk);
+
+    return createForm(frame, authority.authorizationEndpoint, parameters);
+}
+
+/**
+ * Creates form element in the provided document with auth parameters in the post body
+ * @param frame
+ * @param authorizeUrl
+ * @param parameters
+ * @returns
+ */
+function createForm(
+    frame: Document,
+    authorizeUrl: string,
+    parameters: Map<string, string>
+): HTMLFormElement {
+    const form = frame.createElement("form");
+    form.method = "post";
+    form.action = authorizeUrl;
+
+    parameters.forEach((value: string, key: string) => {
+        const param = frame.createElement("input");
+        param.hidden = true;
+        param.name = key;
+        param.value = value;
+
+        form.appendChild(param);
+    });
+
+    frame.body.appendChild(form);
+    return form;
 }
