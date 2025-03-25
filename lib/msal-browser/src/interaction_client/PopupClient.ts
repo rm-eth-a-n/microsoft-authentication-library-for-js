@@ -4,14 +4,11 @@
  */
 
 import {
-    CommonAuthorizationCodeRequest,
     AuthorizationCodeClient,
-    ThrottlingUtils,
     CommonEndSessionRequest,
     UrlString,
     AuthError,
     OIDC_DEFAULT_SCOPES,
-    ProtocolUtils,
     PerformanceEvents,
     IPerformanceClient,
     Logger,
@@ -34,7 +31,6 @@ import { EndSessionPopupRequest } from "../request/EndSessionPopupRequest.js";
 import { NavigationOptions } from "../navigation/NavigationOptions.js";
 import * as BrowserUtils from "../utils/BrowserUtils.js";
 import { PopupRequest } from "../request/PopupRequest.js";
-import { NativeInteractionClient } from "./NativeInteractionClient.js";
 import { NativeMessageHandler } from "../broker/nativeBroker/NativeMessageHandler.js";
 import {
     createBrowserAuthError,
@@ -44,12 +40,11 @@ import { INavigationClient } from "../navigation/INavigationClient.js";
 import { EventHandler } from "../event/EventHandler.js";
 import { BrowserCacheManager } from "../cache/BrowserCacheManager.js";
 import { BrowserConfiguration } from "../config/Configuration.js";
-import { InteractionHandler } from "../interaction_handler/InteractionHandler.js";
 import { PopupWindowAttributes } from "../request/PopupWindowAttributes.js";
 import { EventError } from "../event/EventMessage.js";
 import { AuthenticationResult } from "../response/AuthenticationResult.js";
 import * as ResponseHandler from "../response/ResponseHandler.js";
-import { getAuthCodeRequestUrl, getEARForm } from "../protocol/Authorize.js";
+import * as Authorize from "../protocol/Authorize.js";
 import { generatePkceCodes } from "../crypto/PkceGenerator.js";
 import { generateEarKey } from "../crypto/BrowserCrypto.js";
 
@@ -90,6 +85,7 @@ export class PopupClient extends StandardInteractionClient {
         // Properly sets this reference for the unload event.
         this.unloadWindow = this.unloadWindow.bind(this);
         this.nativeStorage = nativeStorageImpl;
+        this.eventHandler = eventHandler;
     }
 
     /**
@@ -289,19 +285,9 @@ export class PopupClient extends StandardInteractionClient {
                 account: popupRequest.account,
             });
 
-            // Start measurement for server calls with native brokering enabled
-            let fetchNativeAccountIdMeasurement;
-            if (popupRequest.platformBroker) {
-                fetchNativeAccountIdMeasurement =
-                    this.performanceClient.startMeasurement(
-                        PerformanceEvents.FetchAccountIdWithNativeBroker,
-                        request.correlationId
-                    );
-            }
-
             // Create acquire token url.
             const navigateUrl = await invokeAsync(
-                getAuthCodeRequestUrl,
+                Authorize.getAuthCodeRequestUrl,
                 PerformanceEvents.GetAuthCodeUrl,
                 this.logger,
                 this.performanceClient,
@@ -343,75 +329,27 @@ export class PopupClient extends StandardInteractionClient {
                 this.config.auth.OIDCOptions.serverResponseType,
                 this.logger
             );
-            // Remove throttle if it exists
-            ThrottlingUtils.removeThrottle(
-                this.browserStorage,
-                this.config.auth.clientId,
-                popupRequest
-            );
 
-            if (serverParams.accountId) {
-                this.logger.verbose(
-                    "Account id found in hash, calling WAM for token"
-                );
-                // end measurement for server call with native brokering enabled
-                if (fetchNativeAccountIdMeasurement) {
-                    fetchNativeAccountIdMeasurement.end({
-                        success: true,
-                        isNativeBroker: true,
-                    });
-                }
-
-                if (!this.nativeMessageHandler) {
-                    throw createBrowserAuthError(
-                        BrowserAuthErrorCodes.nativeConnectionNotEstablished
-                    );
-                }
-                const nativeInteractionClient = new NativeInteractionClient(
-                    this.config,
-                    this.browserStorage,
-                    this.browserCrypto,
-                    this.logger,
-                    this.eventHandler,
-                    this.navigationClient,
-                    ApiId.acquireTokenPopup,
-                    this.performanceClient,
-                    this.nativeMessageHandler,
-                    serverParams.accountId,
-                    this.nativeStorage,
-                    correlationId
-                );
-                const { userRequestState } = ProtocolUtils.parseRequestState(
-                    this.browserCrypto,
-                    popupRequest.state
-                );
-                return await nativeInteractionClient.acquireToken({
-                    ...popupRequest,
-                    state: userRequestState,
-                    prompt: undefined, // Server should handle the prompt, ideally native broker can do this part silently
-                });
-            }
-
-            const authCodeRequest: CommonAuthorizationCodeRequest = {
-                ...popupRequest,
-                code: serverParams.code || "",
-                codeVerifier: pkce.verifier,
-            };
-            // Create popup interaction handler.
-            const interactionHandler = new InteractionHandler(
+            return await invokeAsync(
+                Authorize.handleResponseCode,
+                PerformanceEvents.HandleResponseCode,
+                this.logger,
+                this.performanceClient,
+                correlationId
+            )(
+                request,
+                serverParams,
+                pkce.verifier,
+                ApiId.acquireTokenPopup,
+                this.config,
                 authClient,
                 this.browserStorage,
-                authCodeRequest,
+                this.nativeStorage,
+                this.eventHandler,
                 this.logger,
-                this.performanceClient
+                this.performanceClient,
+                this.nativeMessageHandler
             );
-            // Handle response from hash string.
-            const result = await interactionHandler.handleCodeResponse(
-                serverParams,
-                popupRequest
-            );
-
-            return result;
         } catch (e) {
             // Close the synchronous popup if an error is thrown before the window unload event is registered
             popupParams.popup?.close();
@@ -461,7 +399,7 @@ export class PopupClient extends StandardInteractionClient {
         const popupWindow =
             popupParams.popup || this.openPopup("about:blank", popupParams);
 
-        const form = await getEARForm(
+        const form = await Authorize.getEARForm(
             popupWindow.document,
             this.config,
             discoveredAuthority,
@@ -472,7 +410,7 @@ export class PopupClient extends StandardInteractionClient {
         form.submit();
 
         // Monitor the popup for the hash. Return the string value and close the popup when the hash is received. Default timeout is 60 seconds.
-        await invokeAsync(
+        const responseString = await invokeAsync(
             this.monitorPopupForHash.bind(this),
             PerformanceEvents.SilentHandlerMonitorIframeForHash,
             this.logger,
@@ -480,7 +418,37 @@ export class PopupClient extends StandardInteractionClient {
             correlationId
         )(popupWindow, popupParams.popupWindowParent);
 
-        throw "EAR flow not fully implemented yet";
+        const serverParams = invoke(
+            ResponseHandler.deserializeResponse,
+            PerformanceEvents.DeserializeResponse,
+            this.logger,
+            this.performanceClient,
+            this.correlationId
+        )(
+            responseString,
+            this.config.auth.OIDCOptions.serverResponseType,
+            this.logger
+        );
+
+        return invokeAsync(
+            Authorize.handleResponseEAR,
+            PerformanceEvents.HandleResponseEar,
+            this.logger,
+            this.performanceClient,
+            correlationId
+        )(
+            popupRequest,
+            serverParams,
+            ApiId.acquireTokenPopup,
+            this.config,
+            discoveredAuthority,
+            this.browserStorage,
+            this.nativeStorage,
+            this.eventHandler,
+            this.logger,
+            this.performanceClient,
+            this.nativeMessageHandler
+        );
     }
 
     /**

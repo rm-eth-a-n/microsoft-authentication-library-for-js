@@ -7,10 +7,8 @@ import {
     ICrypto,
     Logger,
     PromptValue,
-    CommonAuthorizationCodeRequest,
     AuthorizationCodeClient,
     AuthError,
-    ProtocolUtils,
     IPerformanceClient,
     PerformanceEvents,
     invokeAsync,
@@ -39,12 +37,10 @@ import {
 } from "../interaction_handler/SilentHandler.js";
 import { SsoSilentRequest } from "../request/SsoSilentRequest.js";
 import { NativeMessageHandler } from "../broker/nativeBroker/NativeMessageHandler.js";
-import { NativeInteractionClient } from "./NativeInteractionClient.js";
 import { AuthenticationResult } from "../response/AuthenticationResult.js";
-import { InteractionHandler } from "../interaction_handler/InteractionHandler.js";
 import * as BrowserUtils from "../utils/BrowserUtils.js";
 import * as ResponseHandler from "../response/ResponseHandler.js";
-import { getAuthCodeRequestUrl } from "../protocol/Authorize.js";
+import * as Authorize from "../protocol/Authorize.js";
 import { generatePkceCodes } from "../crypto/PkceGenerator.js";
 import { generateEarKey } from "../crypto/BrowserCrypto.js";
 
@@ -217,7 +213,6 @@ export class SilentIframeClient extends StandardInteractionClient {
         request: CommonAuthorizationUrlRequest
     ): Promise<AuthenticationResult> {
         const correlationId = request.correlationId;
-        // Get the frame handle for the silent request
         const discoveredAuthority = await invokeAsync(
             this.getDiscoveredAuthority.bind(this),
             PerformanceEvents.StandardInteractionClientGetDiscoveredAuthority,
@@ -258,7 +253,7 @@ export class SilentIframeClient extends StandardInteractionClient {
 
         const responseType = this.config.auth.OIDCOptions.serverResponseType;
         // Monitor the window for the hash. Return the string value and close the popup when the hash is received. Default timeout is 60 seconds.
-        await invokeAsync(
+        const responseString = await invokeAsync(
             monitorIframeForHash,
             PerformanceEvents.SilentHandlerMonitorIframeForHash,
             this.logger,
@@ -274,7 +269,33 @@ export class SilentIframeClient extends StandardInteractionClient {
             responseType
         );
 
-        throw "EAR flow not fully implemented yet";
+        const serverParams = invoke(
+            ResponseHandler.deserializeResponse,
+            PerformanceEvents.DeserializeResponse,
+            this.logger,
+            this.performanceClient,
+            correlationId
+        )(responseString, responseType, this.logger);
+
+        return invokeAsync(
+            Authorize.handleResponseEAR,
+            PerformanceEvents.HandleResponseEar,
+            this.logger,
+            this.performanceClient,
+            correlationId
+        )(
+            silentRequest,
+            serverParams,
+            this.apiId,
+            this.config,
+            discoveredAuthority,
+            this.browserStorage,
+            this.nativeStorage,
+            this.eventHandler,
+            this.logger,
+            this.performanceClient,
+            this.nativeMessageHandler
+        );
     }
 
     /**
@@ -318,7 +339,7 @@ export class SilentIframeClient extends StandardInteractionClient {
         };
         // Create authorize request url
         const navigateUrl = await invokeAsync(
-            getAuthCodeRequestUrl,
+            Authorize.getAuthCodeRequestUrl,
             PerformanceEvents.GetAuthCodeUrl,
             this.logger,
             this.performanceClient,
@@ -371,68 +392,25 @@ export class SilentIframeClient extends StandardInteractionClient {
             correlationId
         )(responseString, responseType, this.logger);
 
-        if (serverParams.accountId) {
-            this.logger.verbose(
-                "Account id found in hash, calling WAM for token"
-            );
-            if (!this.nativeMessageHandler) {
-                throw createBrowserAuthError(
-                    BrowserAuthErrorCodes.nativeConnectionNotEstablished
-                );
-            }
-            const nativeInteractionClient = new NativeInteractionClient(
-                this.config,
-                this.browserStorage,
-                this.browserCrypto,
-                this.logger,
-                this.eventHandler,
-                this.navigationClient,
-                this.apiId,
-                this.performanceClient,
-                this.nativeMessageHandler,
-                serverParams.accountId,
-                this.browserStorage,
-                correlationId
-            );
-            const { userRequestState } = ProtocolUtils.parseRequestState(
-                this.browserCrypto,
-                request.state
-            );
-            return invokeAsync(
-                nativeInteractionClient.acquireToken.bind(
-                    nativeInteractionClient
-                ),
-                PerformanceEvents.NativeInteractionClientAcquireToken,
-                this.logger,
-                this.performanceClient,
-                correlationId
-            )({
-                ...request,
-                state: userRequestState,
-                prompt: request.prompt || PromptValue.NONE,
-            });
-        }
-        const authCodeRequest: CommonAuthorizationCodeRequest = {
-            ...request,
-            code: serverParams.code || "",
-            codeVerifier: pkceCodes.verifier,
-        };
-        // Create silent handler
-        const interactionHandler = new InteractionHandler(
-            authClient,
-            this.browserStorage,
-            authCodeRequest,
-            this.logger,
-            this.performanceClient
-        );
-
-        // Handle response from hash string
         return invokeAsync(
-            interactionHandler.handleCodeResponse.bind(interactionHandler),
-            PerformanceEvents.HandleCodeResponse,
+            Authorize.handleResponseCode,
+            PerformanceEvents.HandleResponseCode,
             this.logger,
             this.performanceClient,
             correlationId
-        )(serverParams, request);
+        )(
+            request,
+            serverParams,
+            pkceCodes.verifier,
+            this.apiId,
+            this.config,
+            authClient,
+            this.browserStorage,
+            this.nativeStorage,
+            this.eventHandler,
+            this.logger,
+            this.performanceClient,
+            this.nativeMessageHandler
+        );
     }
 }

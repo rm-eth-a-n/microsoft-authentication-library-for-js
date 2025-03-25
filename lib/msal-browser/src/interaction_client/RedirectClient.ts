@@ -4,15 +4,12 @@
  */
 
 import {
-    CommonAuthorizationCodeRequest,
     AuthorizationCodeClient,
     UrlString,
     AuthError,
     ServerTelemetryManager,
     Constants,
-    ProtocolUtils,
     AuthorizeResponse,
-    ThrottlingUtils,
     ICrypto,
     Logger,
     IPerformanceClient,
@@ -39,7 +36,6 @@ import {
     BrowserAuthErrorCodes,
 } from "../error/BrowserAuthError.js";
 import { RedirectRequest } from "../request/RedirectRequest.js";
-import { NativeInteractionClient } from "./NativeInteractionClient.js";
 import { NativeMessageHandler } from "../broker/nativeBroker/NativeMessageHandler.js";
 import { BrowserConfiguration } from "../config/Configuration.js";
 import { BrowserCacheManager } from "../cache/BrowserCacheManager.js";
@@ -48,10 +44,9 @@ import { INavigationClient } from "../navigation/INavigationClient.js";
 import { EventError } from "../event/EventMessage.js";
 import { AuthenticationResult } from "../response/AuthenticationResult.js";
 import * as ResponseHandler from "../response/ResponseHandler.js";
-import { getAuthCodeRequestUrl, getEARForm } from "../protocol/Authorize.js";
+import * as Authorize from "../protocol/Authorize.js";
 import { generatePkceCodes } from "../crypto/PkceGenerator.js";
 import { generateEarKey } from "../crypto/BrowserCrypto.js";
-import { InteractionHandler } from "../interaction_handler/InteractionHandler.js";
 
 function getNavigationType(): NavigationTimingType | undefined {
     if (
@@ -216,7 +211,7 @@ export class RedirectClient extends StandardInteractionClient {
 
             // Create acquire token url.
             const navigateUrl = await invokeAsync(
-                getAuthCodeRequestUrl,
+                Authorize.getAuthCodeRequestUrl,
                 PerformanceEvents.GetAuthCodeUrl,
                 this.logger,
                 this.performanceClient,
@@ -277,7 +272,7 @@ export class RedirectClient extends StandardInteractionClient {
         };
         this.browserStorage.cacheAuthorizeRequest(redirectRequest);
 
-        const form = await getEARForm(
+        const form = await Authorize.getEARForm(
             document,
             this.config,
             discoveredAuthority,
@@ -528,38 +523,38 @@ export class RedirectClient extends StandardInteractionClient {
             throw createBrowserAuthError(BrowserAuthErrorCodes.noStateInHash);
         }
 
-        if (serverParams.accountId) {
-            this.logger.verbose(
-                "Account id found in hash, calling WAM for token"
-            );
-            if (!this.nativeMessageHandler) {
-                throw createBrowserAuthError(
-                    BrowserAuthErrorCodes.nativeConnectionNotEstablished
-                );
-            }
-            const nativeInteractionClient = new NativeInteractionClient(
-                this.config,
-                this.browserStorage,
-                this.browserCrypto,
+        if (serverParams.ear_jwe) {
+            const discoveredAuthority = await invokeAsync(
+                this.getDiscoveredAuthority.bind(this),
+                PerformanceEvents.StandardInteractionClientGetDiscoveredAuthority,
                 this.logger,
-                this.eventHandler,
-                this.navigationClient,
-                ApiId.acquireTokenPopup,
                 this.performanceClient,
-                this.nativeMessageHandler,
-                serverParams.accountId,
-                this.nativeStorage,
                 request.correlationId
-            );
-            const { userRequestState } = ProtocolUtils.parseRequestState(
-                this.browserCrypto,
-                state
-            );
-            return nativeInteractionClient.acquireToken({
-                ...request,
-                state: userRequestState,
-                prompt: undefined, // Server should handle the prompt, ideally native broker can do this part silently
+            )({
+                requestAuthority: request.authority,
+                requestAzureCloudOptions: request.azureCloudOptions,
+                requestExtraQueryParameters: request.extraQueryParameters,
+                account: request.account,
             });
+            return invokeAsync(
+                Authorize.handleResponseEAR,
+                PerformanceEvents.HandleResponseEar,
+                this.logger,
+                this.performanceClient,
+                request.correlationId
+            )(
+                request,
+                serverParams,
+                ApiId.acquireTokenRedirect,
+                this.config,
+                discoveredAuthority,
+                this.browserStorage,
+                this.nativeStorage,
+                this.eventHandler,
+                this.logger,
+                this.performanceClient,
+                this.nativeMessageHandler
+            );
         }
 
         const authClient = await invokeAsync(
@@ -569,32 +564,26 @@ export class RedirectClient extends StandardInteractionClient {
             this.performanceClient,
             this.correlationId
         )({ serverTelemetryManager, requestAuthority: request.authority });
-
-        ThrottlingUtils.removeThrottle(
-            this.browserStorage,
-            this.config.auth.clientId,
-            request
-        );
-        const authCodeRequest: CommonAuthorizationCodeRequest = {
-            ...request,
-            code: serverParams.code || "",
-            codeVerifier: codeVerifier,
-        };
-        // Create silent handler
-        const interactionHandler = new InteractionHandler(
-            authClient,
-            this.browserStorage,
-            authCodeRequest,
-            this.logger,
-            this.performanceClient
-        );
         return invokeAsync(
-            interactionHandler.handleCodeResponse.bind(interactionHandler),
-            PerformanceEvents.HandleCodeResponse,
+            Authorize.handleResponseCode,
+            PerformanceEvents.HandleResponseCode,
             this.logger,
             this.performanceClient,
             request.correlationId
-        )(serverParams, request);
+        )(
+            request,
+            serverParams,
+            codeVerifier,
+            ApiId.acquireTokenRedirect,
+            this.config,
+            authClient,
+            this.browserStorage,
+            this.nativeStorage,
+            this.eventHandler,
+            this.logger,
+            this.performanceClient,
+            this.nativeMessageHandler
+        );
     }
 
     /**
